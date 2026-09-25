@@ -85,10 +85,13 @@ def _send(chat_id: str, text: str, reply_to: int = None, parse_mode: str = "Mark
     try:
         urllib.request.urlopen(req, timeout=10)
         print(f"sent ok to {chat_id} ({len(text)} chars)", file=sys.stderr)
+        return "sent"
     except Exception as e:
-        print(f"Telegram send error: {e}", file=sys.stderr)
+        detail = e.read().decode()[:150] if hasattr(e, "read") else str(e)
+        print(f"Telegram send error: {e} {detail}", file=sys.stderr)
         if parse_mode:
-            _send(chat_id, text, reply_to=reply_to, parse_mode=None)
+            return "plain-" + _send(chat_id, text, reply_to=reply_to, parse_mode=None)
+        return f"failed({detail})"
 
 
 _SEEN_UPDATES: set = set()
@@ -109,13 +112,15 @@ class handler(BaseHTTPRequestHandler):
 
         # Respond only after processing: Vercel freezes the function as soon as the
         # response is sent, which left notes stuck on "Analysing".
+        status = "OK"
         try:
-            self._process(body)
+            status = self._process(body) or "OK"
         finally:
+            # Plain-text body is ignored by Telegram; it's a one-line status for debugging.
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"OK")
+            self.wfile.write(status.encode())
 
     def _process(self, body: bytes):
         try:
@@ -142,16 +147,19 @@ class handler(BaseHTTPRequestHandler):
 
             _send(chat_id, "⏳ Analysing note…", reply_to=msg_id)
             result = asyncio.run(run_pipeline(text))
-            print(
-                f"processed: decision={result.decision} score={result.scores.overall} "
-                f"citations={len(result.citations)} timed_out={result.timed_out}",
-                file=sys.stderr,
-            )
             reply  = _build_reply(result)
-            _send(chat_id, reply, reply_to=msg_id)
+            sent   = _send(chat_id, reply, reply_to=msg_id)
+            status = (
+                f"processed: decision={result.decision} score={result.scores.overall} "
+                f"citations={[c.title for c in result.citations]} timed_out={result.timed_out} "
+                f"reply={sent} first_line={reply.splitlines()[0][:80]!r}"
+            )
+            print(status, file=sys.stderr)
+            return status
 
         except Exception as e:
             print(f"Webhook error: {e}", file=sys.stderr)
+            return f"error: {e}"
 
     def log_message(self, format, *args):
         pass
