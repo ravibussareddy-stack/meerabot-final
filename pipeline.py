@@ -204,11 +204,15 @@ def _wikipedia_search(terms: list) -> list:
         )
         req = urllib.request.Request(url, headers={"User-Agent": "MeeraBot/1.0 (skincare-linkedin-bot)"})
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read())
             for item in data.get("query", {}).get("search", []):
                 title = item.get("title", "").strip()
+                # Skip disambiguation and articles that are clearly off-topic medical topics
+                _WIKI_SKIP = {"scar", "wound", "surgery", "drug", "medication", "disease"}
                 if not title or title in seen or "(disambiguation)" in title:
+                    continue
+                if any(s in title.lower() for s in _WIKI_SKIP):
                     continue
                 seen.add(title)
                 page_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
@@ -220,21 +224,30 @@ def _wikipedia_search(terms: list) -> list:
     return results
 
 
-def _google_news_rss(note: str) -> tuple:
-    seen_titles = set()
-    all_citations = []
+async def _fetch_all_sources(note: str) -> tuple:
+    """Fetch news and Wikipedia in parallel so neither waits on the other."""
+    def fetch_news():
+        seen_titles: set = set()
+        results = []
+        for query in _query_variants(note):
+            for c in _rss_fetch(query):
+                if c.title not in seen_titles:
+                    seen_titles.add(c.title)
+                    results.append(c)
+            if len(results) >= 5:
+                break
+        return results
 
-    # 1. Google News — for timely context
-    for query in _query_variants(note):
-        for c in _rss_fetch(query):
-            if c.title not in seen_titles:
-                seen_titles.add(c.title)
-                all_citations.append(c)
-        if len(all_citations) >= 5:
-            break
+    def fetch_wiki():
+        return _wikipedia_search(_wikipedia_terms(note))
 
-    # 2. Wikipedia — for scientific/ingredient backing (always runs)
-    for c in _wikipedia_search(_wikipedia_terms(note)):
+    news_task = asyncio.to_thread(fetch_news)
+    wiki_task = asyncio.to_thread(fetch_wiki)
+    news_results, wiki_results = await asyncio.gather(news_task, wiki_task)
+
+    seen_titles: set = {c.title for c in news_results}
+    all_citations = list(news_results)
+    for c in wiki_results:
         if c.title not in seen_titles:
             seen_titles.add(c.title)
             all_citations.append(c)
@@ -246,11 +259,10 @@ def _google_news_rss(note: str) -> tuple:
         if c.snippet:
             line += f" — {c.snippet}"
         parts.append(line)
+
+    logger.info("Sources: %d news, %d wiki, %d total",
+                len(news_results), len(wiki_results), len(all_citations))
     return "\n".join(parts), all_citations
-
-
-async def _fetch_news(note: str) -> tuple:
-    return await asyncio.to_thread(_google_news_rss, note)
 
 
 # ── Single combined Gemini call ───────────────────────────────────────────────
@@ -275,8 +287,8 @@ async def _run_combined(note: str, news_context: str) -> dict:
 async def run_pipeline(note: str) -> PipelineResult:
     result = PipelineResult()
 
-    # Fetch news in parallel (HTTP only — fast)
-    news_context, citations = await _fetch_news(note)
+    # Fetch news + Wikipedia in parallel (HTTP only — fast)
+    news_context, citations = await _fetch_all_sources(note)
 
     # Single Gemini call: score + draft together, hard 50s timeout
     try:
