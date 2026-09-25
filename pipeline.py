@@ -177,8 +177,19 @@ _TERM_PRIORITY: dict = {
     "ingredient": 2, "bioavailability": 2,
 }
 
-# Wikipedia query suffix per tier — more specific terms need broader context to find their page
-_TIER_SUFFIX = {0: " skincare", 1: " skincare", 2: " skin care routine"}
+# Generic chemistry terms whose own Wikipedia page is industrial — search the skincare form instead.
+_WIKI_QUERY_ALIASES = {
+    "silicone": "dimethicone skin",
+    "dimethicone": "dimethicone skin",
+    "occlusive": "occlusive moisturizer skin",
+    "lipid": "skin lipid barrier",
+    "barrier": "skin barrier stratum corneum",
+}
+
+# "skin" alone also matches medical/anthropology pages (Scurvy, Light skin), so require
+# cosmetic context in the article's opening, or a section that is specifically about skin care.
+_COSMETIC_WORDS = ("cosmetic", "skincare", "skin care", "personal care", "topical")
+_SECTION_WORDS = _COSMETIC_WORDS + ("aging", "ageing")
 
 
 def _wikipedia_terms(note: str) -> list:
@@ -207,42 +218,77 @@ def _wikipedia_terms(note: str) -> list:
         ]
         ranked += [w for w in dict.fromkeys(extra) if w not in ranked]
 
-    return [
-        t + _TIER_SUFFIX.get(_TERM_PRIORITY.get(t, 2), " skincare")
-        for t in ranked[:3]
-    ]
+    return [_WIKI_QUERY_ALIASES.get(t, t + " skin") for t in ranked[:3]]
 
 
-def _wikipedia_search(terms: list) -> list:
-    """Search Wikipedia; return articles with snippets so Gemini can judge relevance."""
-    results = []
-    seen: set = set()
-    for term in terms[:3]:
-        encoded = urllib.parse.quote(term)
-        url = (
-            f"https://en.wikipedia.org/w/api.php"
-            f"?action=query&list=search&srsearch={encoded}"
-            f"&format=json&srlimit=2&srnamespace=0"
-        )
-        req = urllib.request.Request(url, headers={"User-Agent": "MeeraBot/1.0 (skincare-linkedin-bot)"})
+_WIKI_API = "https://en.wikipedia.org/w/api.php"
+_WIKI_SKIP = ("scar", "wound", "surgery", "drug", "medication", "disease", "implant", "bleaching")
+# Wikimedia asks API clients to identify themselves with a contact URL
+_WIKI_UA = "MeeraBot/1.0 (https://github.com/ravibussareddy-stack/meerabot-final)"
+
+
+def _wiki_get(params: dict) -> dict:
+    url = _WIKI_API + "?" + urllib.parse.urlencode({**params, "format": "json"})
+    req = urllib.request.Request(url, headers={"User-Agent": _WIKI_UA})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def _is_cosmetic_lead(text: str) -> bool:
+    t = text.lower()
+    return any(w in t for w in _COSMETIC_WORDS)
+
+
+def _is_skincare_section(section: str) -> bool:
+    s = section.lower().strip()
+    return s == "skin" or any(w in s for w in _SECTION_WORDS)
+
+
+def _wikipedia_search(queries: list) -> list:
+    """Return only skincare-relevant Wikipedia sources, linking to the skin section when the
+    article as a whole is about something else (e.g. Polydimethylsiloxane → #Skin)."""
+    candidates, seen = [], set()
+    for q in queries[:3]:
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-            for item in data.get("query", {}).get("search", []):
-                title = item.get("title", "").strip()
-                # Skip disambiguation and articles that are clearly off-topic medical topics
-                _WIKI_SKIP = {"scar", "wound", "surgery", "drug", "medication", "disease"}
-                if not title or title in seen or "(disambiguation)" in title:
-                    continue
-                if any(s in title.lower() for s in _WIKI_SKIP):
-                    continue
-                seen.add(title)
-                page_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
-                raw = item.get("snippet", "")
-                snippet = raw.replace('<span class="searchmatch">', "").replace("</span>", "")[:160].strip()
-                results.append(Citation(title=title, source="Wikipedia", url=page_url, date="", snippet=snippet))
+            data = _wiki_get({"action": "query", "list": "search", "srsearch": q, "srlimit": 3,
+                              "srnamespace": 0, "srprop": "snippet|sectiontitle"})
         except Exception as exc:
-            logger.warning("Wikipedia search failed for %r: %s", term, exc)
+            _log(f"Wikipedia search failed for {q!r}: {exc}")
+            continue
+        for item in data.get("query", {}).get("search", []):
+            title = item.get("title", "").strip()
+            if not title or title in seen or "(disambiguation)" in title:
+                continue
+            if any(s in title.lower() for s in _WIKI_SKIP):
+                continue
+            seen.add(title)
+            snippet = item.get("snippet", "").replace('<span class="searchmatch">', "").replace("</span>", "")
+            candidates.append((title, item.get("sectiontitle", ""), snippet[:160].strip()))
+
+    if not candidates:
+        return []
+
+    # One call for every candidate's opening paragraph, to judge what the article is about
+    leads = {}
+    try:
+        data = _wiki_get({"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1,
+                          "exlimit": "max", "redirects": 1, "titles": "|".join(t for t, _, _ in candidates)})
+        for page in data.get("query", {}).get("pages", {}).values():
+            leads[page.get("title", "")] = page.get("extract", "")[:800]
+    except Exception as exc:
+        _log(f"Wikipedia extracts failed: {exc}")
+
+    results = []
+    for title, section, snippet in candidates:
+        base = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+        if section and _is_skincare_section(section):
+            url = base + "#" + urllib.parse.quote(section.replace(" ", "_"))
+            label = f"{title} — {section} section"
+        elif _is_cosmetic_lead(leads.get(title, "")):
+            url, label = base, title
+        else:
+            continue  # article isn't about skin, and the match wasn't in a skin section
+        results.append(Citation(title=label, source="Wikipedia", url=url, date="", snippet=snippet))
     return results
 
 
