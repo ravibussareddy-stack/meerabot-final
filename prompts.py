@@ -55,6 +55,11 @@ Assess this note and draft the LinkedIn post.
 Note:
 {note}
 
-Numbered articles (use cited_indices to list any that support a specific claim in the draft — even as a backing reference, not just something woven into the narrative. Leave cited_indices empty only if none are relevant at all):
+Numbered reference articles with snippets:
 {news_context}
+
+CITATION RULE: After writing the draft, re-read each article snippet above.
+If an article's snippet describes something that a reader could look up to verify a factual claim in your draft, put its index in cited_indices.
+You do NOT need to have quoted from it — if the article backs up or contextualises a claim you made, cite it.
+Only leave cited_indices empty if truly none of the articles relate to anything in the draft.
 """
