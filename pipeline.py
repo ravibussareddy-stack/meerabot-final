@@ -228,9 +228,15 @@ def _stem(word: str) -> str:
 def _term_groups(terms) -> list:
     """[(weight, (stem, stem, ...)), ...] — one group per concept, weighted by specificity."""
     groups = []
+    covered: set = set()
     for t in dict.fromkeys(terms):
+        stems = tuple(_stem(s) for s in _TERM_SYNONYMS.get(t, (t,)))
+        # silicone/dimethicone are one concept — don't let synonyms count twice
+        if covered.intersection(stems):
+            continue
+        covered.update(stems)
         weight = 2 if _TERM_PRIORITY.get(t, 2) <= 1 else 1
-        groups.append((weight, tuple(_stem(s) for s in _TERM_SYNONYMS.get(t, (t,)))))
+        groups.append((weight, stems))
     return groups
 
 
@@ -266,7 +272,8 @@ def _research_search(note: str) -> list:
         if k > len(terms):
             continue
         q = " AND ".join(f"TITLE_ABS:{clause(t)}" for t in terms[:k])
-        q += f" AND TITLE_ABS:{context} AND PUB_YEAR:[2010 TO 2026]"
+        # MED/PMC = journal articles only (excludes patents, preprints, theses)
+        q += f" AND TITLE_ABS:{context} AND PUB_YEAR:[2010 TO 2026] AND (SRC:MED OR SRC:PMC)"
         url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urllib.parse.urlencode(
             {"query": q, "format": "json", "pageSize": 8, "resultType": "core"})
         try:
