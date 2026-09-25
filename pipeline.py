@@ -82,14 +82,17 @@ class PipelineResult:
 # ── Gemini call ───────────────────────────────────────────────────────────────
 
 def _generate_with_fallback(**kwargs):
-    last_err = None
+    last_err = quota_err = None
     for model in [MODEL] + FALLBACK_MODELS:
         try:
             return _gemini.models.generate_content(model=model, **kwargs)
         except Exception as e:
             _log(f"Model {model} failed: {str(e)[:120]}")
             last_err = e
-    raise last_err
+            if "RESOURCE_EXHAUSTED" in str(e):
+                quota_err = e
+    # Quota is the actionable cause even if a later fallback was merely overloaded
+    raise quota_err or last_err
 
 
 # ── News fetch (fast, no Gemini) ──────────────────────────────────────────────
