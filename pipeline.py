@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import List
 
 from google import genai
@@ -67,6 +69,7 @@ class Citation:
     url:     str
     date:    str = ""
     snippet: str = ""  # brief excerpt shown to Gemini to establish relevance
+    kind:    str = "news"  # "research" | "news" | "reference"
 
 
 @dataclass
@@ -109,52 +112,16 @@ _STOPWORDS = {
     "looking","insights","give","hi","hello","hey",
 }
 
-# Sources that consistently produce off-topic results
-_JUNK_SOURCES = {"goop", "people", "tmz", "buzzfeed", "cosmopolitan", "allure",
-                 "refinery29", "bustle", "popsugar", "glamour", "elle", "vogue"}
+# Celebrity/lifestyle outlets that produced off-topic matches in testing
+_JUNK_SOURCES = {"goop", "people", "tmz", "buzzfeed", "popsugar", "us weekly", "page six"}
 
-
-def _query_variants(note: str) -> list:
-    words = [
-        w for w in note.lower().split()
-        if len(w) >= 4 and w.isalpha() and w not in _STOPWORDS
-    ]
-    unique = list(dict.fromkeys(words))
-    # Longer words tend to be the specific ingredients/techniques
-    technical = [w for w in unique if len(w) >= 6][:5]
-    short = [w for w in unique if len(w) < 6][:3]
-    return [
-        # Specific ingredient/technique angle — most likely to find a backing source
-        "skincare ingredient science " + " ".join(technical[:4]),
-        # Broader formulation angle using all key words
-        "skincare formulation " + " ".join(unique[:5]),
-        # Mix technical + short words to catch different phrasings
-        "beauty skincare " + " ".join((technical[:2] + short)[:4]),
-    ]
-
-
-def _rss_fetch(query: str) -> list:
-    encoded = urllib.parse.quote(query[:100])
-    url = f"https://news.google.com/rss/search?q={encoded}&hl=en&gl=US&ceid=US:en"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    results = []
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            root = ET.fromstring(resp.read())
-        for item in root.findall(".//item")[:5]:
-            title  = (item.findtext("title")   or "").strip()
-            source = (item.findtext("source")  or "").strip()
-            pub    = (item.findtext("pubDate") or "").strip()
-            link   = (item.findtext("link")    or "").strip()
-            if not title:
-                continue
-            # Skip junk sources
-            if any(j in source.lower() for j in _JUNK_SOURCES):
-                continue
-            results.append(Citation(title=title, source=source, url=link, date=pub))
-    except Exception as exc:
-        logger.warning("RSS fetch failed for %r: %s", query[:40], exc)
-    return results
+# Cosmetic-industry trade press, searched in addition to general beauty news
+_TRADE_SITES = (
+    "cosmeticsdesign.com", "cosmeticsdesign-europe.com", "cosmeticsbusiness.com", "happi.com",
+    "dermatologytimes.com", "personalcareinsights.com", "premiumbeautynews.com",
+    "cosmeticsandtoiletries.com", "beautyindependent.com", "glossy.co",
+)
+_NEWS_MAX_AGE_YEARS = 6
 
 
 # Priority-ordered skincare/formulation terms. Lower number = more specific = searched first.
@@ -170,6 +137,8 @@ _TERM_PRIORITY: dict = {
     "occlusive": 1, "emollient": 1, "humectant": 1, "surfactant": 1,
     "emulsifier": 1, "preservative": 1, "formulation": 1, "keratin": 1,
     "lipid": 1, "sebum": 1, "melanin": 1, "vitamin": 1,
+    "oxidation": 1, "oxidised": 1, "oxidized": 1, "stability": 1,
+    "packaging": 2, "irritation": 2,
     # Tier 2 — general skincare terms
     "serum": 2, "moisturiser": 2, "moisturizer": 2, "cleanser": 2,
     "sunscreen": 2, "exfoliant": 2, "toner": 2, "actives": 2,
@@ -193,7 +162,12 @@ _SECTION_WORDS = _COSMETIC_WORDS + ("aging", "ageing")
 
 
 def _wikipedia_terms(note: str) -> list:
-    """Pick up to 3 skincare terms from the note, highest-priority first, as Wikipedia queries."""
+    """Up to 3 Wikipedia queries built from the note's highest-priority skincare terms."""
+    return [_WIKI_QUERY_ALIASES.get(t, t + " skin") for t in _ranked_terms(note)[:3]]
+
+
+def _ranked_terms(note: str) -> list:
+    """Skincare terms in the note, most specific first, with long-word fallbacks."""
     # Build token set — also split hyphenated words so "silicone-based" → {"silicone", "based"}
     tokens: set = set()
     for w in note.split():
@@ -218,7 +192,157 @@ def _wikipedia_terms(note: str) -> list:
         ]
         ranked += [w for w in dict.fromkeys(extra) if w not in ranked]
 
-    return [_WIKI_QUERY_ALIASES.get(t, t + " skin") for t in ranked[:3]]
+    return ranked
+
+
+# ── Relevance scoring (shared by all source types) ────────────────────────────
+
+# Words that mean the same thing in sources (a "silicone" post is backed by a "dimethicone" paper)
+_TERM_SYNONYMS = {
+    "silicone": ("silicone", "dimethicone", "siloxane"),
+    "dimethicone": ("dimethicone", "silicone", "siloxane"),
+    "occlusive": ("occlusive", "occlusion", "petrolatum"),
+    "moisturiser": ("moisturiser", "moisturizer", "emollient"),
+    "moisturizer": ("moisturizer", "moisturiser", "emollient"),
+    "ascorbic": ("ascorbic", "ascorbyl"),
+    "glycolic": ("glycolic", "aha", "alpha hydroxy", "exfoliat"),
+    "lactic": ("lactic", "aha", "alpha hydroxy"),
+    "salicylic": ("salicylic", "bha", "beta hydroxy"),
+    "oxidation": ("oxidation", "oxidis", "oxidiz", "antioxidant"),
+    "oxidised": ("oxidation", "oxidis", "oxidiz", "antioxidant"),
+    "oxidized": ("oxidation", "oxidis", "oxidiz", "antioxidant"),
+    "irritation": ("irritation", "irritat", "sensitis", "sensitiz"),
+    "niacinamide": ("niacinamide", "nicotinamide"),
+    "retinol": ("retinol", "retinoid"),
+    "barrier": ("barrier", "stratum corneum"),
+    "absorption": ("absorption", "penetration", "permeation"),
+    "penetration": ("penetration", "permeation", "absorption"),
+    "layering": ("layering", "application order"),
+}
+
+
+def _stem(word: str) -> str:
+    return word[: max(5, len(word) - 3)]
+
+
+def _term_groups(terms) -> list:
+    """[(weight, (stem, stem, ...)), ...] — one group per concept, weighted by specificity."""
+    groups = []
+    for t in dict.fromkeys(terms):
+        weight = 2 if _TERM_PRIORITY.get(t, 2) <= 1 else 1
+        groups.append((weight, tuple(_stem(s) for s in _TERM_SYNONYMS.get(t, (t,)))))
+    return groups
+
+
+def _match(text: str, groups: list) -> tuple:
+    """(weighted score, number of distinct concepts matched)."""
+    t = text.lower()
+    hits = [w for w, stems in groups if any(s in t for s in stems)]
+    return sum(hits), len(hits)
+
+
+def _relevance(text: str, groups: list) -> int:
+    return _match(text, groups)[0]
+
+
+def _search_phrase(terms: list, n: int = 2) -> str:
+    return " ".join(terms[:n])
+
+
+# ── Peer-reviewed research (Europe PMC, includes PubMed) ──────────────────────
+
+def _research_search(note: str) -> list:
+    terms = [t for t in _ranked_terms(note) if t in _TERM_PRIORITY][:3]
+    if not terms:
+        return []
+
+    def clause(t):
+        return "(" + " OR ".join(f'"{s}"' for s in _TERM_SYNONYMS.get(t, (t,))) + ")"
+
+    context = '(skin OR cosmetic OR topical OR dermal)'
+    results = []
+    # Most specific first: all top terms together, then fewer until something matches
+    for k in (min(3, len(terms)), 2, 1):
+        if k > len(terms):
+            continue
+        q = " AND ".join(f"TITLE_ABS:{clause(t)}" for t in terms[:k])
+        q += f" AND TITLE_ABS:{context} AND PUB_YEAR:[2010 TO 2026]"
+        url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urllib.parse.urlencode(
+            {"query": q, "format": "json", "pageSize": 8, "resultType": "core"})
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": _WIKI_UA})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+        except Exception as exc:
+            _log(f"Europe PMC failed: {exc}")
+            return results
+        for r in data.get("resultList", {}).get("result", []):
+            title = (r.get("title") or "").strip().rstrip(".")
+            if not title:
+                continue
+            doi = r.get("doi")
+            link = f"https://doi.org/{doi}" if doi else f"https://europepmc.org/article/{r.get('source')}/{r.get('id')}"
+            journal = r.get("journalInfo", {}).get("journal", {}).get("title") or r.get("journalTitle", "")
+            results.append(Citation(
+                title=title, source=journal, url=link, date=str(r.get("pubYear", "")),
+                snippet=(r.get("abstractText") or "")[:600], kind="research"))
+        if results:
+            break
+    return results
+
+
+# ── News: cosmetic trade press + general beauty news (Google News RSS) ────────
+
+def _rss_fetch(query: str, limit: int = 10) -> list:
+    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+        {"q": query, "hl": "en", "gl": "US", "ceid": "US:en"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    results = []
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            root = ET.fromstring(resp.read())
+    except Exception as exc:
+        _log(f"RSS fetch failed for {query[:40]!r}: {exc}")
+        return results
+    cutoff = datetime.now(timezone.utc).year - _NEWS_MAX_AGE_YEARS
+    for item in root.findall(".//item")[:limit]:
+        title  = (item.findtext("title")   or "").strip()
+        source = (item.findtext("source")  or "").strip()
+        link   = (item.findtext("link")    or "").strip()
+        if not title or any(j in source.lower() for j in _JUNK_SOURCES):
+            continue
+        try:
+            published = parsedate_to_datetime(item.findtext("pubDate") or "")
+        except Exception:
+            continue
+        if published.year < cutoff:
+            continue
+        # Google appends " - Source Name" to every headline
+        if source and title.endswith(" - " + source):
+            title = title[: -len(" - " + source)]
+        results.append(Citation(title=title, source=source, url=link,
+                                date=published.strftime("%b %Y"), kind="news"))
+    return results
+
+
+def _news_search(note: str) -> list:
+    terms = _ranked_terms(note)
+    if not terms:
+        return []
+    phrase = _search_phrase(terms)
+    sites = " OR ".join(f"site:{s}" for s in _TRADE_SITES)
+    queries = [
+        f"{phrase} ({sites})",           # trade press
+        f"{phrase} skincare",            # general beauty news
+        f"{_search_phrase(terms, 1)} skincare ingredient",
+    ]
+    seen, out = set(), []
+    for q in queries:
+        for c in _rss_fetch(q):
+            if c.title.lower() not in seen:
+                seen.add(c.title.lower())
+                out.append(c)
+    return out
 
 
 _WIKI_API = "https://en.wikipedia.org/w/api.php"
@@ -288,23 +412,18 @@ def _wikipedia_search(queries: list) -> list:
             url, label = base, title
         else:
             continue  # article isn't about skin, and the match wasn't in a skin section
-        results.append(Citation(title=label, source="Wikipedia", url=url, date="", snippet=snippet))
+        results.append(Citation(title=label, source="Wikipedia", url=url, date="", snippet=snippet,
+                                kind="reference"))
     return results
 
 
 async def _fetch_all_sources(note: str) -> tuple:
-    """Fetch news and Wikipedia in parallel so neither waits on the other."""
+    """Fetch research, news and Wikipedia in parallel so none waits on the others."""
     def fetch_news():
-        seen_titles: set = set()
-        results = []
-        for query in _query_variants(note):
-            for c in _rss_fetch(query):
-                if c.title not in seen_titles:
-                    seen_titles.add(c.title)
-                    results.append(c)
-            if len(results) >= 5:
-                break
-        return results
+        return _news_search(note)
+
+    def fetch_research():
+        return _research_search(note)
 
     def fetch_wiki():
         return _wikipedia_search(_wikipedia_terms(note))
@@ -316,24 +435,24 @@ async def _fetch_all_sources(note: str) -> tuple:
             _log(f"source fetch dropped ({fn.__name__}): {type(exc).__name__}")
             return []
 
-    news_results, wiki_results = await asyncio.gather(bounded(fetch_news), bounded(fetch_wiki))
+    research, news, wiki = await asyncio.gather(
+        bounded(fetch_research), bounded(fetch_news), bounded(fetch_wiki))
 
-    seen_titles: set = {c.title for c in news_results}
-    all_citations = list(news_results)
-    for c in wiki_results:
-        if c.title not in seen_titles:
-            seen_titles.add(c.title)
-            all_citations.append(c)
+    # Pre-rank against the note so Gemini sees the most relevant candidates first
+    groups = _term_groups(_ranked_terms(note))
+    all_citations = []
+    for batch, keep in ((research, 5), (news, 6), (wiki, 4)):
+        ranked = sorted(batch, key=lambda c: _relevance(c.title + " " + c.snippet, groups), reverse=True)
+        all_citations += ranked[:keep]
 
-    # Build numbered context for Gemini — include snippet so it can judge relevance
     parts = []
     for i, c in enumerate(all_citations):
-        line = f"[{i}] {c.title} ({c.source})"
+        line = f"[{i}] ({c.kind}) {c.title} ({c.source} {c.date})".rstrip()
         if c.snippet:
-            line += f" — {c.snippet}"
+            line += f" — {c.snippet[:200]}"
         parts.append(line)
 
-    _log(f"Sources: {len(news_results)} news, {len(wiki_results)} wiki, {len(all_citations)} total")
+    _log(f"Sources: {len(research)} research, {len(news)} news, {len(wiki)} wiki")
     return "\n".join(parts), all_citations
 
 
@@ -388,23 +507,35 @@ async def run_pipeline(note: str) -> PipelineResult:
         linkedin_potential= int(s.get("linkedin_potential", 5)),
     )
 
-    # Gemini-decided citations (works well for news articles)
-    used = set(raw.get("cited_indices", []) or [])
-    gemini_cited = {i for i in used if isinstance(i, int) and 0 <= i < len(citations)}
-
-    # Auto-cite Wikipedia articles whose snippet shares a known technical term with the draft.
-    # Gemini consistently skips citing its own knowledge — bypass that for encyclopedic sources.
-    draft_lower = result.draft.lower()
-    draft_terms = {t for t in _TERM_PRIORITY if t in draft_lower}
-    auto_wiki = set()
-    if draft_terms:
-        for i, c in enumerate(citations):
-            if c.source == "Wikipedia" and c.snippet:
-                snippet_lower = c.snippet.lower()
-                if any(t in snippet_lower for t in draft_terms):
-                    auto_wiki.add(i)
-
-    final_indices = gemini_cited | auto_wiki
-    result.citations = [c for i, c in enumerate(citations) if i in final_indices]
-
+    result.citations = _select_citations(note, result.draft, citations)
     return result
+
+
+_MAX_PER_KIND = 2
+
+
+def _qualifies(c: Citation, groups: list) -> bool:
+    """A single shared word ("silicone") is too ambiguous — silicone patches, shampoo — so
+    headlines must hit two concepts. Papers must be *about* a concept (title), and overlap
+    with the post on at least two (title + abstract)."""
+    _, title_hits = _match(c.title, groups)
+    if c.kind == "news":
+        return title_hits >= 2
+    if c.kind == "research":
+        score, hits = _match(c.title + " " + c.snippet, groups)
+        return title_hits >= 1 and hits >= 2 and score >= 4
+    return title_hits >= 1  # reference: article/section must be named for a concept
+
+
+def _select_citations(note: str, draft: str, citations: list) -> list:
+    """Pick the sources that actually back this draft. Done deterministically: Gemini tends
+    to leave citations empty when the claims come from its own knowledge."""
+    draft_lower = draft.lower()
+    groups = _term_groups(_ranked_terms(note) + [t for t in _TERM_PRIORITY if t in draft_lower])
+    picked = []
+    for kind in ("research", "news", "reference"):
+        ok = [c for c in citations if c.kind == kind and _qualifies(c, groups)]
+        ok.sort(key=lambda c: (_match(c.title, groups)[0], _relevance(c.title + " " + c.snippet, groups)),
+                reverse=True)
+        picked += ok[:_MAX_PER_KIND]
+    return picked

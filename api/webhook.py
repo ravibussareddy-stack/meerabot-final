@@ -28,16 +28,32 @@ def _format_scores(r: PipelineResult) -> str:
     return "\n".join(lines)
 
 
+_KIND_HEADINGS = (
+    ("research", "🔬 *Research*"),
+    ("news", "📰 *News & industry*"),
+    ("reference", "📚 *Reference*"),
+)
+
+
+def _md_safe(text: str) -> str:
+    # Telegram's legacy Markdown breaks on unbalanced brackets/asterisks/underscores in titles
+    return "".join(ch for ch in text if ch not in "[]*_`")
+
+
 def _format_citations(r: PipelineResult) -> str:
     if not r.citations:
         return ""
-    lines = ["📰 *Sources cited:*"]
-    for c in r.citations:
-        line = f"• [{c.title}]({c.url})"
-        if c.source:
-            line += f" — {c.source}"
-        lines.append(line)
-    return "\n".join(lines)
+    blocks = ["*Sources:*"]
+    for kind, heading in _KIND_HEADINGS:
+        items = [c for c in r.citations if c.kind == kind]
+        if not items:
+            continue
+        lines = [heading]
+        for c in items:
+            meta = ", ".join(x for x in (_md_safe(c.source), c.date) if x)
+            lines.append(f"• [{_md_safe(c.title)}]({c.url})" + (f" — {meta}" if meta else ""))
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 def _build_reply(r: PipelineResult) -> str:
