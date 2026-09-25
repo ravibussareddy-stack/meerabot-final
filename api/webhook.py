@@ -91,6 +91,9 @@ def _send(chat_id: str, text: str, reply_to: int = None, parse_mode: str = "Mark
             _send(chat_id, text, reply_to=reply_to, parse_mode=None)
 
 
+_SEEN_UPDATES: set = set()
+
+
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if WEBHOOK_SECRET:
@@ -104,13 +107,23 @@ class handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
+        # Respond only after processing: Vercel freezes the function as soon as the
+        # response is sent, which left notes stuck on "Analysing".
+        try:
+            self._process(body)
+        finally:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
 
+    def _process(self, body: bytes):
         try:
             update = json.loads(body)
+            update_id = update.get("update_id")
+            if update_id in _SEEN_UPDATES:
+                return  # Telegram retry of an update we already handled
+            _SEEN_UPDATES.add(update_id)
             msg = update.get("channel_post") or update.get("message")
             if not msg:
                 return
