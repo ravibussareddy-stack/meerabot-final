@@ -47,6 +47,9 @@ def _build_reply(r: PipelineResult) -> str:
             "Wait 30 seconds, then resend your note."
         )
 
+    if r.draft.startswith("⚠️"):
+        return r.draft
+
     if r.decision == "SKIP":
         return (
             f"⏭ Not processed — {r.reason}\n\n"
