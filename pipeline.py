@@ -43,10 +43,11 @@ class Scores:
 
 @dataclass
 class Citation:
-    title:  str
-    source: str
-    url:    str
-    date:   str = ""
+    title:   str
+    source:  str
+    url:     str
+    date:    str = ""
+    snippet: str = ""  # brief excerpt shown to Gemini to establish relevance
 
 
 @dataclass
@@ -134,10 +135,66 @@ def _rss_fetch(query: str) -> list:
     return results
 
 
+# Priority-ordered skincare/formulation terms. Lower number = more specific = searched first.
+_TERM_PRIORITY: dict = {
+    # Tier 0 — specific ingredients/chemicals
+    "dimethicone": 0, "silicone": 0, "retinol": 0, "niacinamide": 0,
+    "hyaluronic": 0, "ceramide": 0, "glycolic": 0, "salicylic": 0,
+    "ascorbic": 0, "tretinoin": 0, "benzoyl": 0, "squalane": 0,
+    "bakuchiol": 0, "azelaic": 0, "lactic": 0, "panthenol": 0,
+    "centella": 0, "tranexamic": 0, "kojic": 0, "arbutin": 0,
+    "caffeine": 0, "peptide": 0, "collagen": 0, "elastin": 0,
+    # Tier 1 — formulation concepts
+    "occlusive": 1, "emollient": 1, "humectant": 1, "surfactant": 1,
+    "emulsifier": 1, "preservative": 1, "formulation": 1, "keratin": 1,
+    "lipid": 1, "sebum": 1, "melanin": 1, "vitamin": 1,
+    # Tier 2 — general skincare terms
+    "serum": 2, "moisturiser": 2, "moisturizer": 2, "cleanser": 2,
+    "sunscreen": 2, "exfoliant": 2, "toner": 2, "actives": 2,
+    "barrier": 2, "absorption": 2, "layering": 2, "penetration": 2,
+    "ingredient": 2, "bioavailability": 2,
+}
+
+# Wikipedia query suffix per tier — more specific terms need broader context to find their page
+_TIER_SUFFIX = {0: " skincare", 1: " skincare", 2: " skin care routine"}
+
+
+def _wikipedia_terms(note: str) -> list:
+    """Pick up to 3 skincare terms from the note, highest-priority first, as Wikipedia queries."""
+    # Build token set — also split hyphenated words so "silicone-based" → {"silicone", "based"}
+    tokens: set = set()
+    for w in note.split():
+        clean = w.lower().strip("'\".,;:—-!()?")
+        tokens.add(clean)
+        for part in clean.split("-"):
+            if len(part) >= 4:
+                tokens.add(part)
+
+    found = {t: p for t, p in _TERM_PRIORITY.items() if t in tokens}
+    # Sort: lowest priority tier first, then longer = more specific
+    ranked = sorted(found.keys(), key=lambda t: (_TERM_PRIORITY[t], -len(t)))
+
+    # Fallback: longest alpha words not already covered
+    if len(ranked) < 3:
+        extra = [
+            w.lower().strip("'\".,;:—-") for w in note.split()
+            if len(w.strip("'\".,;:—-")) >= 7
+            and w.strip("'\".,;:—-").isalpha()
+            and w.strip("'\".,;:—-").lower() not in _STOPWORDS
+            and w.strip("'\".,;:—-").lower() not in _TERM_PRIORITY
+        ]
+        ranked += [w for w in dict.fromkeys(extra) if w not in ranked]
+
+    return [
+        t + _TIER_SUFFIX.get(_TERM_PRIORITY.get(t, 2), " skincare")
+        for t in ranked[:3]
+    ]
+
+
 def _wikipedia_search(terms: list) -> list:
-    """Search Wikipedia for key technical terms — returns encyclopedic backing sources."""
+    """Search Wikipedia; return articles with snippets so Gemini can judge relevance."""
     results = []
-    seen = set()
+    seen: set = set()
     for term in terms[:3]:
         encoded = urllib.parse.quote(term)
         url = (
@@ -151,33 +208,16 @@ def _wikipedia_search(terms: list) -> list:
                 data = json.loads(resp.read())
             for item in data.get("query", {}).get("search", []):
                 title = item.get("title", "").strip()
-                if not title or title in seen:
-                    continue
-                # Skip pure disambiguation pages
-                if "(disambiguation)" in title:
+                if not title or title in seen or "(disambiguation)" in title:
                     continue
                 seen.add(title)
                 page_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
-                results.append(Citation(title=title, source="Wikipedia", url=page_url, date=""))
+                raw = item.get("snippet", "")
+                snippet = raw.replace('<span class="searchmatch">', "").replace("</span>", "")[:160].strip()
+                results.append(Citation(title=title, source="Wikipedia", url=page_url, date="", snippet=snippet))
         except Exception as exc:
             logger.warning("Wikipedia search failed for %r: %s", term, exc)
     return results
-
-
-def _wikipedia_terms(note: str) -> list:
-    """Extract 2-3 specific ingredient/technique terms worth looking up on Wikipedia."""
-    words = [
-        w for w in note.lower().split()
-        if len(w) >= 5 and w.isalpha() and w not in _STOPWORDS
-    ]
-    unique = list(dict.fromkeys(words))
-    # Pair adjacent technical words to form compound queries (e.g. "occlusive silicone")
-    terms = []
-    for i in range(min(3, len(unique) - 1)):
-        terms.append(f"{unique[i]} {unique[i+1]} cosmetics")
-    if unique:
-        terms.append(unique[0] + " skincare ingredient")
-    return terms[:3]
 
 
 def _google_news_rss(note: str) -> tuple:
@@ -199,8 +239,13 @@ def _google_news_rss(note: str) -> tuple:
             seen_titles.add(c.title)
             all_citations.append(c)
 
-    # Build numbered context for Gemini
-    parts = [f"[{i}] {c.title} ({c.source})" for i, c in enumerate(all_citations)]
+    # Build numbered context for Gemini — include snippet so it can judge relevance
+    parts = []
+    for i, c in enumerate(all_citations):
+        line = f"[{i}] {c.title} ({c.source})"
+        if c.snippet:
+            line += f" — {c.snippet}"
+        parts.append(line)
     return "\n".join(parts), all_citations
 
 
