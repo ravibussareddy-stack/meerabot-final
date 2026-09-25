@@ -73,7 +73,9 @@ def _build_reply(r: PipelineResult) -> str:
 
 def _send(chat_id: str, text: str, reply_to: int = None, parse_mode: str = "Markdown"):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     data = json.dumps(payload).encode()
@@ -82,8 +84,11 @@ def _send(chat_id: str, text: str, reply_to: int = None, parse_mode: str = "Mark
     )
     try:
         urllib.request.urlopen(req, timeout=10)
+        print(f"sent ok to {chat_id} ({len(text)} chars)", file=sys.stderr)
     except Exception as e:
         print(f"Telegram send error: {e}", file=sys.stderr)
+        if parse_mode:
+            _send(chat_id, text, reply_to=reply_to, parse_mode=None)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -124,6 +129,11 @@ class handler(BaseHTTPRequestHandler):
 
             _send(chat_id, "⏳ Analysing note…", reply_to=msg_id)
             result = asyncio.run(run_pipeline(text))
+            print(
+                f"processed: decision={result.decision} score={result.scores.overall} "
+                f"citations={len(result.citations)} timed_out={result.timed_out}",
+                file=sys.stderr,
+            )
             reply  = _build_reply(result)
             _send(chat_id, reply, reply_to=msg_id)
 
