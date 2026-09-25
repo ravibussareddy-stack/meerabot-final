@@ -55,6 +55,6 @@ Assess this note and draft the LinkedIn post.
 Note:
 {note}
 
-Numbered news items (cite by index ONLY if genuinely relevant and woven into the draft — leave cited_indices empty if none fit):
+Numbered articles (use cited_indices to list any that support a specific claim in the draft — even as a backing reference, not just something woven into the narrative. Leave cited_indices empty only if none are relevant at all):
 {news_context}
 """

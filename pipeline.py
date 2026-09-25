@@ -97,11 +97,16 @@ def _query_variants(note: str) -> list:
         if len(w) >= 4 and w.isalpha() and w not in _STOPWORDS
     ]
     unique = list(dict.fromkeys(words))
-    # Three progressively specific queries
+    # Longer words tend to be the specific ingredients/techniques
+    technical = [w for w in unique if len(w) >= 6][:5]
+    short = [w for w in unique if len(w) < 6][:3]
     return [
-        "skincare formulation " + " ".join(unique[:6]),
-        "beauty ingredient " + " ".join(unique[:4]),
-        "cosmetic brand founder " + " ".join(unique[:3]),
+        # Specific ingredient/technique angle — most likely to find a backing source
+        "skincare ingredient science " + " ".join(technical[:4]),
+        # Broader formulation angle using all key words
+        "skincare formulation " + " ".join(unique[:5]),
+        # Mix technical + short words to catch different phrasings
+        "beauty skincare " + " ".join((technical[:2] + short)[:4]),
     ]
 
 
