@@ -105,7 +105,7 @@ def _google_news_rss(note: str) -> tuple:
     try:
         with urllib.request.urlopen(req, timeout=6) as resp:
             root = ET.fromstring(resp.read())
-        for item in root.findall(".//item")[:3]:
+        for i, item in enumerate(root.findall(".//item")[:3]):
             title  = (item.findtext("title")   or "").strip()
             source = (item.findtext("source")  or "").strip()
             pub    = (item.findtext("pubDate") or "").strip()
@@ -113,7 +113,7 @@ def _google_news_rss(note: str) -> tuple:
             if not title:
                 continue
             citations.append(Citation(title=title, source=source, url=link, date=pub))
-            parts.append(f"• {title} ({source})")
+            parts.append(f"[{i}] {title} ({source})")
     except Exception as exc:
         logger.warning("News fetch failed: %s", exc)
     return "\n".join(parts), citations
@@ -147,7 +147,6 @@ async def run_pipeline(note: str) -> PipelineResult:
 
     # Fetch news in parallel (HTTP only — fast)
     news_context, citations = await _fetch_news(note)
-    result.citations = citations
 
     # Single Gemini call: score + draft together, hard 50s timeout
     try:
@@ -171,5 +170,14 @@ async def run_pipeline(note: str) -> PipelineResult:
         timeliness=         int(s.get("timeliness",         5)),
         linkedin_potential= int(s.get("linkedin_potential", 5)),
     )
+
+    # Only keep citations Gemini explicitly used in the draft
+    used = raw.get("cited_indices", [])
+    if isinstance(used, list) and used:
+        result.citations = [
+            c for i, c in enumerate(citations) if i in used
+        ]
+    else:
+        result.citations = []
 
     return result

@@ -44,7 +44,8 @@ Return ONLY valid JSON — no markdown fences, no explanation:
     "timeliness": <1-10>,
     "linkedin_potential": <1-10>
   },
-  "draft": "<full post text, or empty string if decision is SKIP>"
+  "draft": "<full post text, or empty string if decision is SKIP>",
+  "cited_indices": [<0-based indices of news items you actually wove into the draft — empty list [] if none used>]
 }
 """
 
@@ -54,6 +55,6 @@ Assess this note and draft the LinkedIn post.
 Note:
 {note}
 
-Recent news context (weave in naturally if it adds credibility — do not force it):
+Numbered news items (cite by index ONLY if genuinely relevant and woven into the draft — leave cited_indices empty if none fit):
 {news_context}
 """
