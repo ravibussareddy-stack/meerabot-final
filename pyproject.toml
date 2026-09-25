@@ -1,0 +1,11 @@
+[project]
+name = "meerabot"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=0.7.0",
+    "python-dotenv==1.0.1",
+]
+
+[tool.vercel]
+entrypoint = "api.webhook:handler"
