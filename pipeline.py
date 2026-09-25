@@ -134,17 +134,70 @@ def _rss_fetch(query: str) -> list:
     return results
 
 
+def _wikipedia_search(terms: list) -> list:
+    """Search Wikipedia for key technical terms — returns encyclopedic backing sources."""
+    results = []
+    seen = set()
+    for term in terms[:3]:
+        encoded = urllib.parse.quote(term)
+        url = (
+            f"https://en.wikipedia.org/w/api.php"
+            f"?action=query&list=search&srsearch={encoded}"
+            f"&format=json&srlimit=2&srnamespace=0"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "MeeraBot/1.0 (skincare-linkedin-bot)"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+            for item in data.get("query", {}).get("search", []):
+                title = item.get("title", "").strip()
+                if not title or title in seen:
+                    continue
+                # Skip pure disambiguation pages
+                if "(disambiguation)" in title:
+                    continue
+                seen.add(title)
+                page_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+                results.append(Citation(title=title, source="Wikipedia", url=page_url, date=""))
+        except Exception as exc:
+            logger.warning("Wikipedia search failed for %r: %s", term, exc)
+    return results
+
+
+def _wikipedia_terms(note: str) -> list:
+    """Extract 2-3 specific ingredient/technique terms worth looking up on Wikipedia."""
+    words = [
+        w for w in note.lower().split()
+        if len(w) >= 5 and w.isalpha() and w not in _STOPWORDS
+    ]
+    unique = list(dict.fromkeys(words))
+    # Pair adjacent technical words to form compound queries (e.g. "occlusive silicone")
+    terms = []
+    for i in range(min(3, len(unique) - 1)):
+        terms.append(f"{unique[i]} {unique[i+1]} cosmetics")
+    if unique:
+        terms.append(unique[0] + " skincare ingredient")
+    return terms[:3]
+
+
 def _google_news_rss(note: str) -> tuple:
     seen_titles = set()
     all_citations = []
 
+    # 1. Google News — for timely context
     for query in _query_variants(note):
         for c in _rss_fetch(query):
             if c.title not in seen_titles:
                 seen_titles.add(c.title)
                 all_citations.append(c)
-        if len(all_citations) >= 6:
+        if len(all_citations) >= 5:
             break
+
+    # 2. Wikipedia — for scientific/ingredient backing (always runs)
+    for c in _wikipedia_search(_wikipedia_terms(note)):
+        if c.title not in seen_titles:
+            seen_titles.add(c.title)
+            all_citations.append(c)
 
     # Build numbered context for Gemini
     parts = [f"[{i}] {c.title} ({c.source})" for i, c in enumerate(all_citations)]
