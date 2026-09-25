@@ -301,13 +301,23 @@ async def run_pipeline(note: str) -> PipelineResult:
         linkedin_potential= int(s.get("linkedin_potential", 5)),
     )
 
-    # Only keep citations Gemini explicitly used in the draft
-    used = raw.get("cited_indices", [])
-    if isinstance(used, list) and used:
-        result.citations = [
-            c for i, c in enumerate(citations) if i in used
-        ]
-    else:
-        result.citations = []
+    # Gemini-decided citations (works well for news articles)
+    used = set(raw.get("cited_indices", []) or [])
+    gemini_cited = {i for i in used if isinstance(i, int) and 0 <= i < len(citations)}
+
+    # Auto-cite Wikipedia articles whose snippet shares a known technical term with the draft.
+    # Gemini consistently skips citing its own knowledge — bypass that for encyclopedic sources.
+    draft_lower = result.draft.lower()
+    draft_terms = {t for t in _TERM_PRIORITY if t in draft_lower}
+    auto_wiki = set()
+    if draft_terms:
+        for i, c in enumerate(citations):
+            if c.source == "Wikipedia" and c.snippet:
+                snippet_lower = c.snippet.lower()
+                if any(t in snippet_lower for t in draft_terms):
+                    auto_wiki.add(i)
+
+    final_indices = gemini_cited | auto_wiki
+    result.citations = [c for i, c in enumerate(citations) if i in final_indices]
 
     return result
