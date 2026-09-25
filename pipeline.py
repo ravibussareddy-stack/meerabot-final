@@ -1,7 +1,10 @@
 import asyncio
 import json
 import logging
+import sys
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -15,10 +18,26 @@ from prompts import COMBINED_SYSTEM, COMBINED_USER
 
 logger = logging.getLogger(__name__)
 
-_gemini = genai.Client(api_key=GEMINI_API_KEY)
+# Per-request HTTP timeout so a hung Gemini call can't outlive the Vercel function.
+_gemini = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=40_000))
 
 MODEL = "gemini-3.6-flash"
 FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.7-flash"]
+
+# Own executor: asyncio.run() waits for the *default* executor's threads on exit,
+# which would block the timeout reply until a hung call finished.
+_EXEC = ThreadPoolExecutor(max_workers=8)
+
+SOURCES_BUDGET_S = 10.0
+TOTAL_BUDGET_S = 50.0  # Vercel kills the function at 60s; leave room to send the reply
+
+
+def _log(msg: str):
+    print(msg, file=sys.stderr, flush=True)
+
+
+async def _in_thread(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_EXEC, fn, *args)
 
 
 # ── Data types ────────────────────────────────────────────────────────────────
@@ -68,7 +87,7 @@ def _generate_with_fallback(**kwargs):
         try:
             return _gemini.models.generate_content(model=model, **kwargs)
         except Exception as e:
-            logger.warning("Model %s failed: %s", model, str(e)[:80])
+            _log(f"Model {model} failed: {str(e)[:120]}")
             last_err = e
     raise last_err
 
@@ -241,9 +260,14 @@ async def _fetch_all_sources(note: str) -> tuple:
     def fetch_wiki():
         return _wikipedia_search(_wikipedia_terms(note))
 
-    news_task = asyncio.to_thread(fetch_news)
-    wiki_task = asyncio.to_thread(fetch_wiki)
-    news_results, wiki_results = await asyncio.gather(news_task, wiki_task)
+    async def bounded(fn):
+        try:
+            return await asyncio.wait_for(_in_thread(fn), timeout=SOURCES_BUDGET_S)
+        except Exception as exc:
+            _log(f"source fetch dropped ({fn.__name__}): {type(exc).__name__}")
+            return []
+
+    news_results, wiki_results = await asyncio.gather(bounded(fetch_news), bounded(fetch_wiki))
 
     seen_titles: set = {c.title for c in news_results}
     all_citations = list(news_results)
@@ -260,8 +284,7 @@ async def _fetch_all_sources(note: str) -> tuple:
             line += f" — {c.snippet}"
         parts.append(line)
 
-    logger.info("Sources: %d news, %d wiki, %d total",
-                len(news_results), len(wiki_results), len(all_citations))
+    _log(f"Sources: {len(news_results)} news, {len(wiki_results)} wiki, {len(all_citations)} total")
     return "\n".join(parts), all_citations
 
 
@@ -278,28 +301,31 @@ def _gemini_combined(note: str, news_context: str) -> dict:
     return json.loads(resp.text)
 
 
-async def _run_combined(note: str, news_context: str) -> dict:
-    return await asyncio.to_thread(_gemini_combined, note, news_context)
-
-
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 async def run_pipeline(note: str) -> PipelineResult:
     result = PipelineResult()
+    start = time.monotonic()
 
-    # Fetch news + Wikipedia in parallel (HTTP only — fast)
     news_context, citations = await _fetch_all_sources(note)
+    _log(f"sources took {time.monotonic() - start:.1f}s")
 
-    # Single Gemini call: score + draft together, hard 50s timeout
+    remaining = max(5.0, TOTAL_BUDGET_S - (time.monotonic() - start))
     try:
-        raw = await asyncio.wait_for(_run_combined(note, news_context), timeout=50.0)
+        raw = await asyncio.wait_for(_in_thread(_gemini_combined, note, news_context), timeout=remaining)
     except asyncio.TimeoutError:
+        _log(f"gemini timed out after {time.monotonic() - start:.1f}s total")
         result.timed_out = True
         return result
     except Exception as exc:
-        logger.error("Combined call failed: %s", exc)
-        result.draft = "⚠️ AI model temporarily unavailable. Please resend in a minute."
+        _log(f"Combined call failed: {str(exc)[:200]}")
+        if "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc):
+            result.draft = ("⚠️ Daily AI quota reached (free tier: 20 notes/day). "
+                            "It resets at midnight Pacific time — resend then.")
+        else:
+            result.draft = "⚠️ AI model temporarily unavailable. Please resend in a minute."
         return result
+    _log(f"gemini done at {time.monotonic() - start:.1f}s total")
 
     result.decision = raw.get("decision", "DEVELOP")
     result.reason   = raw.get("reason", "")
