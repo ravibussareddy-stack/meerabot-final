@@ -86,37 +86,64 @@ _STOPWORDS = {
     "looking","insights","give","hi","hello","hey",
 }
 
+# Sources that consistently produce off-topic results
+_JUNK_SOURCES = {"goop", "people", "tmz", "buzzfeed", "cosmopolitan", "allure",
+                 "refinery29", "bustle", "popsugar", "glamour", "elle", "vogue"}
 
-def _keywords(note: str) -> str:
+
+def _query_variants(note: str) -> list:
     words = [
         w for w in note.lower().split()
         if len(w) >= 4 and w.isalpha() and w not in _STOPWORDS
     ]
-    top = " ".join(dict.fromkeys(words[:5]))
-    return ("skincare formulation " + top).strip()[:100]
+    unique = list(dict.fromkeys(words))
+    # Three progressively specific queries
+    return [
+        "skincare formulation " + " ".join(unique[:6]),
+        "beauty ingredient " + " ".join(unique[:4]),
+        "cosmetic brand founder " + " ".join(unique[:3]),
+    ]
 
 
-def _google_news_rss(note: str) -> tuple:
-    query   = _keywords(note)
-    encoded = urllib.parse.quote(query)
-    url     = f"https://news.google.com/rss/search?q={encoded}&hl=en&gl=US&ceid=US:en"
-    req     = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    citations, parts = [], []
+def _rss_fetch(query: str) -> list:
+    encoded = urllib.parse.quote(query[:100])
+    url = f"https://news.google.com/rss/search?q={encoded}&hl=en&gl=US&ceid=US:en"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    results = []
     try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             root = ET.fromstring(resp.read())
-        for i, item in enumerate(root.findall(".//item")[:3]):
+        for item in root.findall(".//item")[:5]:
             title  = (item.findtext("title")   or "").strip()
             source = (item.findtext("source")  or "").strip()
             pub    = (item.findtext("pubDate") or "").strip()
             link   = (item.findtext("link")    or "").strip()
             if not title:
                 continue
-            citations.append(Citation(title=title, source=source, url=link, date=pub))
-            parts.append(f"[{i}] {title} ({source})")
+            # Skip junk sources
+            if any(j in source.lower() for j in _JUNK_SOURCES):
+                continue
+            results.append(Citation(title=title, source=source, url=link, date=pub))
     except Exception as exc:
-        logger.warning("News fetch failed: %s", exc)
-    return "\n".join(parts), citations
+        logger.warning("RSS fetch failed for %r: %s", query[:40], exc)
+    return results
+
+
+def _google_news_rss(note: str) -> tuple:
+    seen_titles = set()
+    all_citations = []
+
+    for query in _query_variants(note):
+        for c in _rss_fetch(query):
+            if c.title not in seen_titles:
+                seen_titles.add(c.title)
+                all_citations.append(c)
+        if len(all_citations) >= 6:
+            break
+
+    # Build numbered context for Gemini
+    parts = [f"[{i}] {c.title} ({c.source})" for i, c in enumerate(all_citations)]
+    return "\n".join(parts), all_citations
 
 
 async def _fetch_news(note: str) -> tuple:
